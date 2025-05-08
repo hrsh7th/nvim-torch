@@ -14,12 +14,15 @@ local misc = require('torch.misc')
 ---@field public callback fun(ctx: torch.CharmapContext)
 
 ---@class torch.CharmapContext
+---@field public schedule fun()
+---@field public feedkeys fun(keys: string, remap?: boolean)
 ---@field public prevent fun(callback: fun())
+---@field public close fun()
 ---@field public is_menu_visible fun(): boolean
 ---@field public complete fun(option?: { force?: boolean })
 ---@field public get_selection fun(): cmp-kit.core.Selection
 ---@field public select fun(index: integer, preselect?: boolean)
----@field public commit fun(index: integer, option?: { replace?: boolean })
+---@field public commit fun(index: integer, option?: { replace?: boolean, no_snippet?: boolean })
 ---@field public fallback fun()
 
 ---@class torch.preset.InsertModeOption
@@ -43,6 +46,9 @@ local misc = require('torch.misc')
 
 local torch = {}
 
+torch.preset_source = require('torch.preset.source')
+torch.preset_keymap = require('torch.preset.keymap')
+
 local private = {
   ---The attached services for buffer.
   ---@type table<integer, torch.ServiceRegistration>
@@ -63,6 +69,22 @@ local private = {
   },
 }
 
+---Get the current service.
+---@return cmp-kit.core.CompletionService?
+local function get_service()
+  if private.onetime then
+    return private.onetime.service
+  end
+
+  if vim.api.nvim_get_mode().mode == 'i' then
+    local v = private.attached_i[vim.api.nvim_get_current_buf()]
+    return v and v.service
+  else
+    local v = private.attached_c[vim.fn.getcmdtype()]
+    return v and v.service
+  end
+end
+
 ---Setup char mapping.
 do
   vim.on_key(function(_, typed)
@@ -77,7 +99,7 @@ do
     end
 
     -- check service conditions.
-    local service = torch.get_service()
+    local service = get_service()
     if not service then
       return
     end
@@ -98,6 +120,15 @@ do
         callback()
         resume()
       end,
+      schedule = function()
+        Async.schedule():await()
+      end,
+      feedkeys = function(keys, remap)
+        Keymap.send({ { keys = keys, remap = not not remap } }):await()
+      end,
+      close = function()
+        service:clear()
+      end,
       is_menu_visible = function()
         return service:is_menu_visible()
       end,
@@ -111,7 +142,7 @@ do
         service:select(index, preselect):await()
       end,
       commit = function(index, option)
-        local match = torch.get_service():get_match_at(index)
+        local match = get_service():get_match_at(index)
         if match then
           service:commit(match.item, option):await()
         else
@@ -136,7 +167,7 @@ do
   local rev = 0
   misc.autocmd('TextChangedI', {
     callback = function()
-      local service = torch.get_service()
+      local service = get_service()
       if service then
         service:complete()
       end
@@ -144,9 +175,9 @@ do
   })
   misc.autocmd('CursorMovedI', {
     callback = function()
-      local service = torch.get_service()
-      if service then
-        service:matching()
+      local service = get_service()
+      if service and service:is_menu_visible() then
+        service:complete()
       end
     end
   })
@@ -179,9 +210,11 @@ do
         if c ~= rev then
           return
         end
-        local service = torch.get_service()
-        if service then
-          service:complete()
+        if vim.fn.mode(1):sub(1, 1) == 'c' then
+          local service = get_service()
+          if service then
+            service:complete()
+          end
         end
       end)
     end
@@ -209,22 +242,6 @@ end
 ---@param config torch.Config|{}
 function torch.setup(config)
   private.config = kit.merge(config, private.config)
-end
-
----Get the current service.
----@return cmp-kit.core.CompletionService?
-function torch.get_service()
-  if private.onetime then
-    return private.onetime.service
-  end
-
-  if vim.api.nvim_get_mode().mode == 'i' then
-    local v = private.attached_i[vim.api.nvim_get_current_buf()]
-    return v and v.service
-  else
-    local v = private.attached_c[vim.fn.getcmdtype()]
-    return v and v.service
-  end
 end
 
 torch.attach = {}
@@ -276,7 +293,7 @@ end
 ---@param option { force?: boolean }
 ---@param setup fun(service: cmp-kit.core.CompletionService): fun()[]
 function torch.onetime(option, setup)
-  local current_service = torch.get_service()
+  local current_service = get_service()
   if current_service then
     current_service:clear()
   end
@@ -303,112 +320,6 @@ function torch.onetime(option, setup)
       private.onetime.dispose()
     end
   end)
-end
-
-torch.preset = {}
-
----Create preset service for insert-mode.
----@param service cmp-kit.core.CompletionService
----@param opts? torch.preset.InsertModeOption
----@return fun()[]
-function torch.preset.i(service, opts)
-  opts = opts or {}
-  opts.disable_providers = opts.disable_providers or {}
-
-  local bufnr = vim.api.nvim_get_current_buf()
-  local disposes = {}
-
-  -- lsp.completion.
-  if not opts.disable_providers.lsp_completion then
-    local attached = {} --[[@type table<integer, fun()>]]
-    -- attach.
-    local function attach()
-      for _, client in ipairs(vim.lsp.get_clients({ bufnr = bufnr })) do
-        if attached[client.id] then
-          attached[client.id]()
-        end
-        attached[client.id] = service:register_source(
-          require('cmp-kit.ext.source.lsp.completion')({
-            client = client --[[@as vim.lsp.Client]],
-          }), {
-            group = 1,
-            priority = 100
-          })
-      end
-    end
-    table.insert(disposes, misc.autocmd('InsertEnter', {
-      callback = attach
-    }))
-    table.insert(disposes, misc.autocmd('LspAttach', {
-      callback = attach
-    }))
-
-    -- detach.
-    table.insert(disposes, misc.autocmd('LspDetach', {
-      callback = function(e)
-        if attached[e.data.client_id] then
-          attached[e.data.client_id]()
-          attached[e.data.client_id] = nil
-        end
-      end
-    }))
-  end
-
-  -- path.
-  if not opts.disable_providers.path then
-    service:register_source(require('cmp-kit.ext.source.path')(), {
-      group = 10,
-    })
-  end
-
-  -- buffer.
-  if not opts.disable_providers.buffer then
-    service:register_source(require('cmp-kit.ext.source.buffer')({
-      keyword_pattern = [[\k\+]],
-      min_keyword_length = 3,
-    }), {
-      group = 100,
-      dedup = true,
-    })
-  end
-
-  return disposes
-end
-
----Create preset service for cmdline-mode.
----@param service cmp-kit.core.CompletionService
----@param opts? torch.preset.CmdlineModeOption
----@return fun()[]
-function torch.preset.c(service, opts)
-  opts = opts or {}
-  opts.disable_providers = opts.disable_providers or {}
-
-  -- path.
-  if not opts.disable_providers.path then
-    service:register_source(require('cmp-kit.ext.source.path')(), {
-      group = 1,
-    })
-  end
-
-  -- cmdline.
-  if not opts.disable_providers.cmdline then
-    service:register_source(require('cmp-kit.ext.source.cmdline')(), {
-      group = 10,
-    })
-  end
-
-  -- buffer.
-  if not opts.disable_providers.buffer then
-    service:register_source(require('cmp-kit.ext.source.buffer')({
-      keyword_pattern = [[\k\+]],
-      min_keyword_length = 3,
-    }), {
-      group = 100,
-      dedup = true,
-    })
-  end
-
-  return {}
 end
 
 ---Setup character mapping.

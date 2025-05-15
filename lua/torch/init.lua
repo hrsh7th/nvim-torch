@@ -19,9 +19,11 @@ local misc = require('torch.misc')
 ---@field public prevent fun(callback: fun())
 ---@field public close fun()
 ---@field public is_menu_visible fun(): boolean
+---@field public is_docs_visible fun(): boolean
 ---@field public complete fun(option?: { force?: boolean })
 ---@field public get_selection fun(): cmp-kit.core.Selection
 ---@field public select fun(index: integer, preselect?: boolean)
+---@field public scroll_docs fun(delta: integer)
 ---@field public commit fun(index: integer, option?: { replace?: boolean, no_snippet?: boolean })
 ---@field public fallback fun()
 
@@ -88,11 +90,15 @@ end
 ---Setup char mapping.
 do
   vim.on_key(function(_, typed)
+    if not typed or typed == '' then
+      return
+    end
     local mode = vim.api.nvim_get_mode().mode
+
 
     -- find charmap.
     local charmap = vim.iter(private.charmaps):find(function(charmap)
-      return vim.tbl_contains(charmap.mode, mode) and typed == charmap.char
+      return vim.tbl_contains(charmap.mode, mode) and vim.fn.keytrans(typed) == vim.fn.keytrans(charmap.char)
     end)
     if not charmap then
       return
@@ -132,6 +138,9 @@ do
       is_menu_visible = function()
         return service:is_menu_visible()
       end,
+      is_docs_visible = function()
+        return service:is_docs_visible()
+      end,
       get_selection = function()
         return service:get_selection()
       end,
@@ -140,6 +149,9 @@ do
       end,
       select = function(index, preselect)
         service:select(index, preselect):await()
+      end,
+      scroll_docs = function(delta)
+        service:scroll_docs(delta)
       end,
       commit = function(index, option)
         local match = get_service():get_match_at(index)
